@@ -2,10 +2,10 @@ lint:
 	go fmt ./...
 
 build:
-	go build -o ./bin/ftree ./cmd/ftree/main.go
+	go build -o ./bin/ftree main.go
 
 run:
-	go run ./cmd/ftree/main.go
+	go run main.go
 
 install: build
 	cp ./bin/ftree ~/.local/bin/ftree
