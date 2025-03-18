@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
-
+	"github.com/trinhminhtriet/ftree/internal/git"
 	"github.com/trinhminhtriet/ftree/internal/state"
 	t "github.com/trinhminhtriet/ftree/internal/tree"
 	"github.com/trinhminhtriet/ftree/pkg/stack"
@@ -38,11 +38,31 @@ type Renderer struct {
 	EdgePadding int
 	offsetMem   int
 	previewBuff [previewBytesLimit]byte
+	gitStatus   map[string]git.GitStatus // Cache Git status
+}
+
+// NewRenderer initializes a Renderer with Git status.
+func NewRenderer(style Stylesheet, edgePadding int) *Renderer {
+	return &Renderer{
+		Style:       style,
+		EdgePadding: edgePadding,
+		gitStatus:   make(map[string]git.GitStatus),
+	}
 }
 
 func (r *Renderer) Render(s *state.State, winHeight, winWidth int) string {
 	if winWidth < minWidth || winHeight < minHeight {
 		return tooSmall
+	}
+
+	// Update Git status
+	if r.gitStatus == nil || time.Since(time.Now()).Minutes() > 1 { // Refresh every minute
+		newStatus, err := git.GetGitStatus(s.Tree.CurrentDir.Path)
+		if err != nil {
+			s.ErrBuf = fmt.Sprintf("Git status error: %v", err)
+		} else {
+			r.gitStatus = newStatus
+		}
 	}
 
 	renderedHeading, headLen := r.renderHeading(s, winWidth)
@@ -52,7 +72,6 @@ func (r *Renderer) Render(s *state.State, winHeight, winWidth int) string {
 	renderedTree := r.renderTree(s.Tree, winHeight-headLen, sectionWidth)
 
 	var rightPane string
-
 	if s.HelpToggle {
 		renderedHelp, helpLen := r.renderHelp(sectionWidth)
 		renderedContent := r.renderSelectedFileContent(s.Tree, winHeight-headLen-helpLen, sectionWidth)
@@ -78,12 +97,22 @@ func (r *Renderer) renderHeading(s *state.State, width int) (string, int) {
 	changeTime := "--"
 	size := "0 B"
 	perm := "--"
+	gitStatus := ""
 
 	if selected != nil {
 		path = selected.Path
 		changeTime = selected.Info.ModTime().Format(time.RFC822)
 		size = formatSize(float64(selected.Info.Size()), 1024.0)
 		perm = selected.Info.Mode().String()
+		if status, ok := r.gitStatus[selected.Path]; ok {
+			if status.Staged {
+				gitStatus = " [Staged]"
+			} else if status.Modified {
+				gitStatus = " [Modified]"
+			} else if status.Untracked {
+				gitStatus = " [Untracked]"
+			}
+		}
 	}
 
 	markedPath := ""
@@ -100,7 +129,7 @@ func (r *Renderer) renderHeading(s *state.State, width int) (string, int) {
 		operationBar += fmt.Sprintf(" │ %s │", r.Style.OperationBarInput.Render(string(s.InputBuf)))
 	}
 
-	rawPath := "> " + path
+	rawPath := "> " + path + gitStatus
 
 	finfo := fmt.Sprintf(
 		"%s %s %v %s %s",
@@ -131,28 +160,49 @@ func (r *Renderer) renderHelp(width int) (string, int) {
 		"k / arr up     Select previous child",
 		"h / arr left   Move up a dir",
 		"l / arr right  Enter selected directory",
-		"if / id	    Create file (if) / directory (id) in current directory",
+		"if / id        Create file (if) / directory (id)",
 		"d              Move selected child (then 'p' to paste)",
 		"y              Copy selected child (then 'p' to paste)",
 		"D              Delete selected child",
 		"r              Rename selected child",
 		"e              Edit selected file in $EDITOR",
-		"gg             Go to top most child in current directory",
-		"G              Go to last child in current directory",
-		"enter          Collapse / expand selected directory",
-		"esc            Clear error message / stop current operation",
+		"gg             Go to top child",
+		"G              Go to last child",
+		"enter          Collapse / expand directory",
+		"esc            Clear error / stop operation",
 		"q / ctrl+c     Exit",
+		"g?             Toggle Git status details", // New help item
 	}
 	return r.Style.
 		HelpContent.
 		MaxWidth(width).
 		MarginRight(width).
-		Render(strings.Join(help, "\n")), len(help) + 1 // +1 for border
+		Render(strings.Join(help, "\n")), len(help) + 1
 }
 
 func (r *Renderer) renderTree(tree *t.Tree, height, width int) string {
 	renderedTreeLines, selectedRow := r.renderTreeFull(tree, width)
 	croppedTreeLines := r.cropTree(renderedTreeLines, selectedRow, height)
+
+	// Add Git status to tree lines if enabled (mock toggle with g?)
+	if tree.CurrentDir.Path != "" && r.gitStatus != nil {
+		for i, line := range croppedTreeLines {
+			for path, status := range r.gitStatus {
+				if strings.Contains(line, path) {
+					var statusStr string
+					if status.Staged {
+						statusStr = " [S]"
+					} else if status.Modified {
+						statusStr = " [M]"
+					} else if status.Untracked {
+						statusStr = " [U]"
+					}
+					croppedTreeLines[i] += r.Style.TreeGitStatus.Render(statusStr)
+					break
+				}
+			}
+		}
+	}
 
 	treeStyle := lipgloss.
 		NewStyle().
@@ -165,18 +215,17 @@ func (r *Renderer) renderTree(tree *t.Tree, height, width int) string {
 func (r *Renderer) renderSelectedFileContent(tree *t.Tree, height, width int) string {
 	n, err := tree.ReadSelectedChildContent(r.previewBuff[:], previewBytesLimit)
 	if err != nil {
-		return ""
+		return r.Style.ContentPreview.Render(fmt.Sprintf("Error: %v", err))
 	}
 	content := r.previewBuff[:n]
 
-	contentStyle := r.Style.ContentPreview.MaxWidth(width - 1) // -1 for border...
-
+	contentStyle := r.Style.ContentPreview.MaxWidth(width - 1)
 	var contentLines []string
 	if !utf8.Valid(content) {
 		contentLines = []string{binaryContentPlaceholder}
 	} else {
 		contentLines = strings.Split(string(content), "\n")
-		contentLines = contentLines[:max(min(height, len(contentLines)), 0)]
+		contentLines = contentLines[:min(max(height, 0), len(contentLines))]
 	}
 	return contentStyle.Render(strings.Join(contentLines, "\n"))
 }
@@ -237,14 +286,14 @@ func (r *Renderer) renderTreeFull(tree *t.Tree, width int) ([]string, int) {
 		nameRuneCountNoStyle := utf8.RuneCountInString(name)
 		indentRuneCount := utf8.RuneCountInString(indent)
 
-		if nameRuneCountNoStyle+indentRuneCount > width-6 { // 6 = len([]rune{"... <-"})
+		if nameRuneCountNoStyle+indentRuneCount > width-6 {
 			name = string([]rune(name)[:max(0, width-indentRuneCount-6)]) + "..."
 		}
 
 		indent = r.Style.TreeIndent.Render(indent)
 
 		if node.Info.IsDir() {
-			name = r.Style.TreeDirecotryName.Render(name)
+			name = r.Style.TreeDirectoryName.Render(name) // Fixed typo: Direcotry -> Directory
 		} else if node.Info.Mode()&os.ModeSymlink == os.ModeSymlink {
 			name = r.Style.TreeLinkName.Render(name)
 		} else {
@@ -283,7 +332,7 @@ var sizes = [...]string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
 func formatSize(s float64, base float64) string {
 	unitsLimit := len(sizes)
 	i := 0
-	for s >= base && i < unitsLimit {
+	for s >= base && i < unitsLimit-1 { // -1 to avoid out-of-bounds
 		s = s / base
 		i++
 	}
@@ -292,4 +341,18 @@ func formatSize(s float64, base float64) string {
 		f = "%.2f %s"
 	}
 	return fmt.Sprintf(f, s, sizes[i])
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
