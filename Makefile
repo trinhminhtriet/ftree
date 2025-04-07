@@ -1,11 +1,34 @@
-lint:
-	go fmt ./...
+NAME    := ftree
+PACKAGE := github.com/trinhminhtriet/$(NAME)
+DATE    :=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+GIT     := $(shell [ -d .git ] && git rev-parse --short HEAD)
+VERSION := $(shell git describe --tags)
+
+default: build
+
+upgrade:
+	go get -u && go mod tidy
 
 build:
-	go build -o ./bin/ftree main.go
+	CGO_ENABLED=0 go build \
+	-a -tags netgo -o dist/${NAME} main.go
 
-run:
-	go run main.go
+build-link:
+	CGO_ENABLED=0 go build \
+		-a -tags netgo -o dist/${NAME} main.go
+	ln -sf ${PWD}/dist/${NAME} /usr/local/bin/${NAME}
 
-install: build
-	cp ./bin/ftree ~/.local/bin/ftree
+release:
+	goreleaser build --clean --snapshot --single-target
+
+release-all:
+	goreleaser build --clean --snapshot
+
+link:
+	ln -sf ${PWD}/dist/${NAME} /usr/local/bin/${NAME}
+	which ${NAME}
+
+clean:
+	$(RM) -rf dist
+
+.PHONY: default tidy build build-link release release-all
